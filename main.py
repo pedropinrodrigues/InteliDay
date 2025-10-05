@@ -4,15 +4,10 @@ import numpy as np
 import os
 import json
 import time
+import subprocess
+import sys
 from pathlib import Path
 from PIL import Image
-import av
-from streamlit_webrtc import (
-    RTCConfiguration,
-    VideoProcessorBase,
-    WebRtcMode,
-    webrtc_streamer,
-)
 
 # Configuração da página
 st.set_page_config(page_title="Sistema de Reconhecimento Facial", layout="wide")
@@ -25,9 +20,13 @@ def load_face_classifier():
 
 face_cascade = load_face_classifier()
 
-# Estado global para reconhecimento
-if 'webrtc_playing' not in st.session_state:
-    st.session_state.webrtc_playing = False
+# Estado global para a janela nativa de reconhecimento
+if 'native_camera_process' not in st.session_state:
+    st.session_state.native_camera_process = None
+if 'native_camera_threshold' not in st.session_state:
+    st.session_state.native_camera_threshold = 70.0
+if 'native_camera_error' not in st.session_state:
+    st.session_state.native_camera_error = None
 
 # Funções auxiliares
 def detect_faces(image):
@@ -87,50 +86,44 @@ def load_recognizer():
     except:
         return None, None
 
+
+def annotate_frame(frame_bgr, recognizer, inv_labels, threshold):
+    annotated = frame_bgr.copy()
+    faces, gray = detect_faces(frame_bgr)
+
+    if len(faces) == 0:
+        cv2.putText(annotated, "Nenhuma face detectada", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        return annotated
+
+    for (x, y, w, h) in faces:
+        face = gray[y:y+h, x:x+w]
+        face_resized = cv2.resize(face, (200, 200))
+
+        label_id, distance = recognizer.predict(face_resized)
+        name = inv_labels.get(label_id, "Desconhecido")
+        is_known = distance <= threshold
+
+        rect_color = (0, 255, 0) if is_known else (0, 0, 255)
+        bg_color = (0, 200, 0) if is_known else (0, 0, 200)
+
+        cv2.rectangle(annotated, (x, y), (x+w, y+h), rect_color, 3)
+
+        display_name = name if is_known else "DESCONHECIDO"
+        (text_width, _), _ = cv2.getTextSize(display_name, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(annotated, (x, y-30), (x + text_width + 10, y), bg_color, -1)
+        cv2.putText(annotated, display_name, (x+5, y-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        status = "✓ AUTORIZADO" if is_known else "✗ NEGADO"
+        cv2.putText(annotated, status, (x, y+h+25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, rect_color, 2)
+
+    return annotated
+
+
 # Componentes de interface reutilizáveis
 TAB_LABELS = ["📸 Cadastrar Pessoa", "🎯 Treinar Modelo", "🔍 Reconhecer"]
-
-RTC_CONFIGURATION = RTCConfiguration({
-    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-})
-
-
-class FaceRecognitionProcessor(VideoProcessorBase):
-    def __init__(self, recognizer, inv_labels, threshold):
-        self.recognizer = recognizer
-        self.inv_labels = inv_labels
-        self.threshold = threshold
-
-    def set_threshold(self, threshold):
-        self.threshold = threshold
-
-    def recv(self, frame):
-        image = frame.to_ndarray(format="bgr24")
-        faces, gray = detect_faces(image)
-
-        for (x, y, w, h) in faces:
-            face = gray[y:y+h, x:x+w]
-            face_resized = cv2.resize(face, (200, 200))
-
-            label_id, distance = self.recognizer.predict(face_resized)
-            name = self.inv_labels.get(label_id, "Desconhecido")
-            is_known = distance <= self.threshold
-
-            rect_color = (0, 255, 0) if is_known else (0, 0, 255)
-            bg_color = (0, 200, 0) if is_known else (0, 0, 200)
-
-            cv2.rectangle(image, (x, y), (x+w, y+h), rect_color, 3)
-
-            display_name = name if is_known else "DESCONHECIDO"
-            (text_width, _), _ = cv2.getTextSize(display_name, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            cv2.rectangle(image, (x, y-30), (x + text_width + 10, y), bg_color, -1)
-            cv2.putText(image, display_name, (x+5, y-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-            status = "✓ AUTORIZADO" if is_known else "✗ NEGADO"
-            cv2.putText(image, status, (x, y+h+25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, rect_color, 2)
-        return av.VideoFrame.from_ndarray(image, format="bgr24")
 
 def render_register_tab():
     st.header("Cadastrar Nova Pessoa")
@@ -145,7 +138,9 @@ def render_register_tab():
         col1, col2 = st.columns([2, 1])
 
         with col1:
-            if st.session_state.webrtc_playing:
+            proc = st.session_state.native_camera_process
+            native_running = proc is not None and proc.poll() is None
+            if native_running:
                 st.info("⚠️ Pare o reconhecimento em tempo real antes de cadastrar uma nova pessoa.")
             else:
                 img_file = st.camera_input("Tire uma foto para cadastro")
@@ -255,47 +250,107 @@ def render_recognition_tab():
         st.warning("⚠️ Modelo não encontrado! Treine o modelo primeiro na aba 'Treinar Modelo'.")
         return
 
-    threshold = st.slider("Limiar de Confiança", 0.0, 150.0, 70.0, 5.0)
+    threshold = st.slider(
+        "Limiar de Confiança",
+        0.0,
+        150.0,
+        float(st.session_state.native_camera_threshold),
+        5.0,
+    )
+    st.session_state.native_camera_threshold = threshold
     st.caption("Menor valor = mais rigoroso")
 
-    def processor_factory():
-        return FaceRecognitionProcessor(recognizer, inv_labels, threshold)
+    proc = st.session_state.native_camera_process
+    running = proc is not None and proc.poll() is None
+    if running:
+        st.caption("Para aplicar um novo limiar, feche e reabra a janela nativa.")
 
-    video_constraints = {
-        "width": {"min": 1280, "ideal": 1920},
-        "height": {"min": 720, "ideal": 1080},
-        "frameRate": {"ideal": 60, "max": 60},
-        "aspectRatio": 16 / 9,
-    }
+    col_start, col_stop = st.columns(2)
 
-    ctx = webrtc_streamer(
-        key="face-recognition",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": video_constraints, "audio": False},
-        video_processor_factory=processor_factory,
-        async_processing=False,
-        video_html_attrs={
-            "style": {
-                "width": "1840px",
-                "maxWidth": "100%",
-                "height": "880px",
-                "borderRadius": "12px",
-                "objectFit": "cover",
-            },
-            "playsInline": True,
-            "controls": False,
-            "autoPlay": True,
-        },
-    )
+    proc = st.session_state.native_camera_process
+    running = proc is not None and proc.poll() is None
 
-    if ctx.state.playing:
-        st.session_state.webrtc_playing = True
-        if ctx.video_processor:
-            ctx.video_processor.set_threshold(threshold)
+    with col_start:
+        start_native = st.button(
+            "🎥 Abrir janela nativa",
+            type="primary",
+            use_container_width=True,
+            disabled=running,
+        )
+    with col_stop:
+        stop_native = st.button(
+            "⏹️ Fechar janela nativa",
+            type="secondary",
+            use_container_width=True,
+            disabled=not running,
+        )
+
+    proc = st.session_state.native_camera_process
+    running = proc is not None and proc.poll() is None
+
+    if start_native:
+        if running:
+            st.info("A janela nativa já está aberta. Feche-a manualmente ou use 'Fechar janela nativa'.")
+        else:
+            script_path = Path(__file__).resolve().parent / "face_recognition" / "utils" / "native_view.py"
+            if not script_path.exists():
+                st.error("Arquivo 'face_recognition/utils/native_view.py' não encontrado.")
+            else:
+                try:
+                    cmd = [
+                        sys.executable,
+                        str(script_path),
+                        "--threshold",
+                        str(threshold),
+                    ]
+                    env = os.environ.copy()
+                    proc = subprocess.Popen(cmd, env=env)
+                    time.sleep(0.2)
+                    if proc.poll() is not None and proc.returncode not in (0, None):
+                        st.session_state.native_camera_process = None
+                        st.session_state.native_camera_error = (
+                            f"Processo da câmera finalizou imediatamente (código {proc.returncode})."
+                        )
+                    else:
+                        st.session_state.native_camera_process = proc
+                        running = True
+                        st.success("Janela nativa aberta. Pressione 'q' nela ou use 'Fechar'.")
+                except Exception as exc:
+                    st.session_state.native_camera_error = str(exc)
+                    st.error(f"Erro ao abrir janela nativa: {exc}")
+
+    if stop_native and running:
+        proc = st.session_state.native_camera_process
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        st.session_state.native_camera_process = None
+        st.session_state.native_camera_error = None
+        running = False
+
+    proc = st.session_state.native_camera_process
+    if proc is not None and proc.poll() is not None:
+        return_code = proc.returncode
+        st.session_state.native_camera_process = None
+        running = False
+        if return_code not in (0, None):
+            st.session_state.native_camera_error = (
+                st.session_state.native_camera_error
+                or f"Processo da câmera terminou com código {return_code}."
+            )
+
+    error_message = st.session_state.native_camera_error
+    if error_message:
+        st.error(error_message)
+        st.session_state.native_camera_error = None
+
+    if running:
+        st.info("Janela nativa em execução. Pressione 'q' na janela ou use o botão de fechar para encerrar.")
     else:
-        st.session_state.webrtc_playing = False
-        st.info("📹 Clique em 'Start' para iniciar o reconhecimento em tempo real")
+        st.caption("A captura acontece fora do navegador. Pressione 'q' na janela nativa para fechá-la.")
 
 
 if 'active_tab' not in st.session_state:
@@ -307,7 +362,14 @@ selected_tab = st.radio("Navegação", TAB_LABELS,
 st.session_state.active_tab = selected_tab
 
 if selected_tab != TAB_LABELS[2]:
-    st.session_state.webrtc_playing = False
+    proc = st.session_state.native_camera_process
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    st.session_state.native_camera_process = None
 
 if selected_tab == TAB_LABELS[0]:
     render_register_tab()
