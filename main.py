@@ -234,13 +234,25 @@ def render_recognition_tab():
         rtc_configuration=RTC_CONFIGURATION,
         media_stream_constraints={"video": True, "audio": False},
         video_processor_factory=processor_factory,
-        async_processing=True,
-        video_html_attrs={"style": {"width": "480px", "max-width": "100%"}},
+        async_processing=False,
+        video_html_attrs={
+            "style": {
+                "width": "1440px",
+                "maxWidth": "100%",
+                "height": "1080px",
+                "borderRadius": "12px",
+                "objectFit": "cover",
+            },
+            "playsInline": True,
+            "controls": False,
+            "autoPlay": True,
+        },
     )
 
-    if ctx.video_processor:
-        ctx.video_processor.set_threshold(threshold)
-        st.session_state.webrtc_playing = ctx.state.playing
+    if ctx.state.playing:
+        st.session_state.webrtc_playing = True
+        if ctx.video_processor:
+            ctx.video_processor.set_threshold(threshold)
     else:
         st.session_state.webrtc_playing = False
         st.info("📹 Clique em 'Start' para iniciar o reconhecimento em tempo real")
