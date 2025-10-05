@@ -167,7 +167,7 @@ def render_register_tab():
                         col_btn1, col_btn2 = st.columns([1, 1])
 
                         with col_btn1:
-                            if st.button("💾 Salvar Cadastro", type="primary", width="stretch"):
+                            if st.button("💾 Salvar Cadastro", type="primary", use_container_width=True):
                                 saved_count = 0
                                 for (x, y, w, h) in faces:
                                     face = gray[y:y+h, x:x+w]
@@ -183,7 +183,7 @@ def render_register_tab():
                                 st.rerun()
 
                         with col_btn2:
-                            if st.button("🔄 Nova Foto", type="secondary", width="stretch"):
+                            if st.button("🔄 Nova Foto", type="secondary", use_container_width=True):
                                 st.rerun()
                     else:
                         st.warning("⚠️ Nenhuma face detectada! Tente novamente com melhor iluminação.")
@@ -202,6 +202,39 @@ def render_register_tab():
 
 def render_training_tab():
     st.header("Treinar Modelo de Reconhecimento")
+
+    col_train, col_reset = st.columns([2, 1])
+
+    with col_train:
+        if st.button("🚀 Treinar Modelo", type="primary", use_container_width=True):
+            with st.spinner("Treinando modelo..."):
+                success, message = train_model()
+
+            if success:
+                st.success(message)
+                st.cache_resource.clear()
+            else:
+                st.error(message)
+
+    with col_reset:
+        if st.button("🗑️ Resetar Modelo", type="secondary", use_container_width=True):
+            model_path = Path("face_recognition/model.yml")
+            labels_path = Path("face_recognition/labels.json")
+
+            deleted = []
+            for path in [model_path, labels_path]:
+                try:
+                    path.unlink(missing_ok=True)
+                    deleted.append(path.name)
+                except Exception as exc:
+                    st.error(f"Erro ao remover {path.name}: {exc}")
+                    return
+
+            st.cache_resource.clear()
+            if deleted:
+                st.success("Arquivos redefinidos: " + ", ".join(deleted))
+            else:
+                st.info("Nenhum arquivo de modelo encontrado para remover.")
 
     if st.button("🚀 Treinar Modelo", type="primary"):
         with st.spinner("Treinando modelo..."):
@@ -228,18 +261,25 @@ def render_recognition_tab():
     def processor_factory():
         return FaceRecognitionProcessor(recognizer, inv_labels, threshold)
 
+    video_constraints = {
+        "width": {"min": 1280, "ideal": 1920},
+        "height": {"min": 720, "ideal": 1080},
+        "frameRate": {"ideal": 60, "max": 60},
+        "aspectRatio": 16 / 9,
+    }
+
     ctx = webrtc_streamer(
         key="face-recognition",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
+        media_stream_constraints={"video": video_constraints, "audio": False},
         video_processor_factory=processor_factory,
         async_processing=False,
         video_html_attrs={
             "style": {
-                "width": "1440px",
+                "width": "1840px",
                 "maxWidth": "100%",
-                "height": "1080px",
+                "height": "880px",
                 "borderRadius": "12px",
                 "objectFit": "cover",
             },
